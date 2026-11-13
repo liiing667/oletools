@@ -93,6 +93,8 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 from oletools.common import clsid
+from oletools.common.decompression_budget import (
+    DecompressionBudget, DecompressionLimitExceeded, LimitedReader)
 from oletools.thirdparty.xglob import xglob
 
 # === LOGGING =================================================================
@@ -402,8 +404,8 @@ class FType_Generic_OpenXML(FType_Base):
         except KeyError:
             return False
         try:
-            root_rels = ftg.zipfile.read('_rels/.rels')
-        except RuntimeError:
+            root_rels = ftg.zip_read_limited('_rels/.rels')
+        except (RuntimeError, DecompressionLimitExceeded):
             return False
         # parse the XML content
         # TODO: handle XML parsing exceptions
@@ -444,8 +446,8 @@ class FType_Generic_OpenXML(FType_Base):
 
         # parse content types, find content type of main part
         try:
-            content_types = ftg.zipfile.read('[Content_Types].xml')
-        except RuntimeError:
+            content_types = ftg.zip_read_limited('[Content_Types].xml')
+        except (RuntimeError, DecompressionLimitExceeded):
             return False
         # parse the XML content
         # TODO: handle XML parsing exceptions
@@ -806,6 +808,8 @@ class FileTypeGuesser(object):
         self.root_clsid_name = None
         # For ZIP:
         self.zipfile = None
+        # Shared budget limiting decompressed size of zip members
+        self.decompression_budget = DecompressionBudget()
         # For OpenXML:
         self.root_rels = None
         # self.main_part_xmltag = None
@@ -871,6 +875,24 @@ class FileTypeGuesser(object):
         # TODO: only close self.olefile if it was opened by ftguess
         if self.zipfile is not None:
             self.zipfile.close()
+
+    def zip_read_limited(self, member):
+        """Read a zip member while enforcing the decompression budget.
+
+        Behaves like ``self.zipfile.read(member)`` for valid data, but streams
+        the member through :attr:`decompression_budget` so an over-sized
+        member raises :class:`DecompressionLimitExceeded` instead of being
+        expanded fully into memory. The declared member size is checked
+        before decompression.
+        """
+        info = self.zipfile.getinfo(member)
+        self.decompression_budget.begin_member(
+            member, declared_size=info.file_size)
+        with self.zipfile.open(member, 'r') as raw_handle:
+            limited = LimitedReader(raw_handle,
+                                    self.decompression_budget, member,
+                                    begin=False)
+            return limited.read()
 
     def is_ole(self):
         """

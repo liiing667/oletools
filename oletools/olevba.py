@@ -346,6 +346,9 @@ from oletools.common.io_encoding import ensure_stdout_handles_unicode
 from oletools.common import codepages
 from oletools import ftguess
 from oletools.common.log_helper import log_helper
+from oletools.common.decompression_budget import (
+    DecompressionBudget, DecompressionLimitExceeded, LimitedReader,
+    read_limited, CHUNK_SIZE)
 
 # === PYTHON 2+3 SUPPORT ======================================================
 
@@ -487,7 +490,7 @@ class MsoExtractionError(RuntimeError, OlevbaBaseException):
     """ raised by mso_file_extract if parsing MSO/ActiveMIME data failed """
 
     def __init__(self, msg):
-        MsoExtractionError.__init__(self, msg)
+        RuntimeError.__init__(self, msg)
         OlevbaBaseException.__init__(self, msg)
 
 
@@ -1221,16 +1224,25 @@ def is_mso_file(data):
 
 
 # regex to find zlib block headers, starting with byte 0x78 = 'x'
-re_zlib_header = re.compile(r'x')
+# (bytes pattern: this is matched against binary data, not text)
+re_zlib_header = re.compile(b'x')
 
 
-def mso_file_extract(data):
+def mso_file_extract(data, budget=None, name=None):
     """
     Extract the data stored into a MSO/ActiveMime file, such as
     the ones created by Outlook in some cases, or Word/Excel when saving a
     file with the MHTML format or the Word 2003 XML format.
 
     :param data: bytes string, MSO/ActiveMime file content
+    :param budget: optional
+        :py:class:`oletools.common.decompression_budget.DecompressionBudget`
+        used to limit the amount of decompressed data (protects against
+        zip/decompression bombs nested in ActiveMime parts). When given, the
+        budget is charged for every decompressed byte and a
+        :py:class:`DecompressionLimitExceeded` error aborts the extraction
+        before an oversized result is assembled.
+    :param name: name of the part, used in budget error messages
     :return: bytes string, extracted data (uncompressed)
 
     raise a MsoExtractionError if the data cannot be extracted
@@ -1258,8 +1270,10 @@ def mso_file_extract(data):
     for start in offsets:
         try:
             log.debug('Attempting zlib decompression from MSO file offset 0x%X' % start)
-            extracted_data = zlib.decompress(data[start:])
-            return extracted_data
+            return _zlib_decompress_limited(data[start:], budget, name)
+        except DecompressionLimitExceeded:
+            # budget breach is a hard error, never try another offset
+            raise
         except zlib.error as exc:
             log.info('zlib decompression failed for offset %s (%s)'
                      % (start, exc))
@@ -1271,12 +1285,52 @@ def mso_file_extract(data):
         start = match.start()
         try:
             log.debug('Attempting zlib decompression from MSO file offset 0x%X' % start)
-            extracted_data = zlib.decompress(data[start:])
-            return extracted_data
+            return _zlib_decompress_limited(data[start:], budget, name)
+        except DecompressionLimitExceeded:
+            # budget breach is a hard error, never try another offset
+            raise
         except zlib.error as exc:
             log.info('zlib decompression failed (%s)' % exc)
             log.debug('Trace:', exc_info=True)
     raise MsoExtractionError('Unable to decompress data from a MSO/ActiveMime file')
+
+
+def _zlib_decompress_limited(compressed, budget=None, name=None):
+    """Decompress zlib data in chunks, optionally enforcing a budget.
+
+    Without a budget this simply uses :func:`zlib.decompress`, preserving the
+    exact historical behaviour. With a budget, a streaming decompressor pulls
+    fixed-size chunks so that an over-limit stream raises
+    :py:class:`DecompressionLimitExceeded` before the full output is built;
+    any bytes already charged for the part are returned to the budget on
+    failure, leaving no partial accounting behind.
+    """
+    if budget is None:
+        return zlib.decompress(compressed)
+    budget.begin_member(name)
+    decompressor = zlib.decompressobj()
+    parts = []
+    try:
+        for index in range(0, len(compressed), CHUNK_SIZE):
+            chunk = decompressor.decompress(compressed[index:index + CHUNK_SIZE])
+            if chunk:
+                budget.charge(len(chunk))
+                parts.append(chunk)
+        tail = decompressor.flush()
+        if tail:
+            budget.charge(len(tail))
+            parts.append(tail)
+        if not decompressor.eof:
+            # mirror zlib.decompress(): a truncated stream that never reaches
+            # its end marker is an error, not an empty result
+            raise zlib.error('incomplete or truncated stream')
+        return b''.join(parts)
+    except DecompressionLimitExceeded:
+        budget.discard_member()
+        raise
+    except zlib.error:
+        budget.discard_member()
+        raise
 
 
 #--- FUNCTIONS ----------------------------------------------------------------
@@ -2681,7 +2735,7 @@ class VBA_Parser(object):
     # TODO: relaxed is enabled by default temporarily, until a solution is found for issue #593
 
     def __init__(self, filename, data=None, container=None, relaxed=True, encoding=DEFAULT_API_ENCODING,
-                 disable_pcode=False):
+                 disable_pcode=False, decompression_budget=None):
         """
         Constructor for VBA_Parser
 
@@ -2700,6 +2754,13 @@ class VBA_Parser(object):
         :param str encoding: encoding for VBA source code and strings.
             Default: UTF-8 bytes strings on Python 2, unicode strings on Python 3 (None)
 
+        :param decompression_budget: optional
+            :py:class:`oletools.common.decompression_budget.DecompressionBudget`
+            used to limit decompressed data read from zip members and nested
+            ActiveMime parts. If ``None``, a new budget with the default safe
+            limits is created; sub-parsers created for embedded subfiles share
+            the same budget so the limits apply to the whole container.
+
         raises a FileOpenError if all attempts to interpret the data header failed.
         """
         # TODO: filename should only be a string, data should be used for the file-like object
@@ -2716,6 +2777,9 @@ class VBA_Parser(object):
         #self.file = _file
         self.ole_file = None
         self.ole_subfiles = []
+        # one shared budget for the whole container (zip members and nested
+        # ActiveMime parts); embedded sub-parsers inherit it via append_subfile
+        self.decompression_budget = decompression_budget or DecompressionBudget()
         self.filename = filename
         self.container = container
         self.relaxed = relaxed
@@ -2855,10 +2919,24 @@ class VBA_Parser(object):
             z = zipfile.ZipFile(_file)
             #TODO: check if this is actually an OpenXML file
             #TODO: if the zip file is encrypted, suggest to use the -z option, or try '-z infected' automatically
+            # total budget: reject archives whose members declare more data in
+            # total than allowed, even members that are only peeked at below
+            self.decompression_budget.check_declared_total(
+                (info.file_size for info in z.infolist()),
+                name=self.filename)
             # check each file within the zip if it is an OLE file, by reading its magic:
             for subfile in z.namelist():
                 log.debug("OpenXML subfile {}".format(subfile))
-                with z.open(subfile) as file_handle:
+                # enforce the shared decompression budget: reject the member
+                # up-front if its declared size already exceeds a limit, and
+                # account for every decompressed byte while reading it
+                declared_size = z.getinfo(subfile).file_size
+                self.decompression_budget.begin_member(
+                    subfile, declared_size=declared_size)
+                with z.open(subfile) as raw_handle:
+                    file_handle = LimitedReader(
+                        raw_handle, self.decompression_budget, subfile,
+                        begin=False)
                     # found_ole = False
                     # template_injection_detected = False
                     # xml_macrosheet_found = False
@@ -2894,8 +2972,18 @@ class VBA_Parser(object):
                 #
                 # if found_ole or xml_macrosheet_found or template_injection_detected:
                         log.debug('Opening OLE file %s within zip' % subfile)
-                        with z.open(subfile) as file_handle:
-                            ole_data = file_handle.read()
+                        # the same member is re-read from scratch below:
+                        # return the bytes of the magic-check read first so
+                        # the member is counted only once
+                        self.decompression_budget.discard_member()
+                        with z.open(subfile) as raw_handle:
+                            # fresh member accounting for this second read;
+                            # read_limited aborts before an oversized member
+                            # can be assembled in memory
+                            self.decompression_budget.begin_member(
+                                subfile, declared_size=declared_size)
+                            ole_data = read_limited(
+                                raw_handle, self.decompression_budget, subfile)
                         try:
                             self.append_subfile(filename=subfile, data=ole_data)
                         except OlevbaBaseException as exc:
@@ -2909,6 +2997,13 @@ class VBA_Parser(object):
             z.close()
             # set type only if parsing succeeds
             self.type = TYPE_OpenXML
+        except DecompressionLimitExceeded as exc:
+            # a decompression bomb (per-member or total budget) is a hard
+            # error: report it explicitly instead of silently continuing with
+            # partial results
+            log.error('Refusing to parse %s: %s' % (self.filename, exc))
+            log.debug('Trace:', exc_info=True)
+            raise FileOpenError(self.filename, exc)
         except OlevbaBaseException as exc:
             if self.relaxed:
                 log.info('Error {0} caught in Zip/OpenXML parsing for file {1}'
@@ -2945,8 +3040,17 @@ class VBA_Parser(object):
                     # decompress the zlib data stored in the MSO file, which is the OLE container:
                     # TODO: handle different offsets => separate function
                     try:
-                        ole_data = mso_file_extract(mso_data)
+                        ole_data = mso_file_extract(
+                            mso_data, budget=self.decompression_budget,
+                            name=fname)
                         self.append_subfile(filename=fname, data=ole_data)
+                    except DecompressionLimitExceeded as exc:
+                        # decompression bomb inside an ActiveMime part: hard
+                        # error, do not continue with partial subfiles
+                        log.error('Refusing to parse %s: %s'
+                                  % (self.filename, exc))
+                        log.debug('Trace:', exc_info=True)
+                        raise FileOpenError(self.filename, exc)
                     except OlevbaBaseException as exc:
                         if self.relaxed:
                             log.info('Error parsing subfile {0}: {1}'
@@ -2958,6 +3062,12 @@ class VBA_Parser(object):
                     log.info('%s is not a valid MSO file' % fname)
             # set type only if parsing succeeds
             self.type = TYPE_Word2003_XML
+        except DecompressionLimitExceeded:
+            # decompression bombs are a hard error even in relaxed mode
+            raise
+        except FileOpenError:
+            # explicit refusal to parse must not be downgraded either
+            raise
         except OlevbaBaseException as exc:
             if self.relaxed:
                 log.info('Failed XML parsing for file %r (%s)' % (self.filename, exc))
@@ -3066,11 +3176,20 @@ class VBA_Parser(object):
                 if isinstance(part_data, bytes) and is_mso_file(part_data):
                     log.debug('Found ActiveMime header, decompressing MSO container')
                     try:
-                        ole_data = mso_file_extract(part_data)
+                        ole_data = mso_file_extract(
+                            part_data, budget=self.decompression_budget,
+                            name=fname)
 
                         # TODO: check if it is actually an OLE file
                         # TODO: get the MSO filename from content_location?
                         self.append_subfile(filename=fname, data=ole_data)
+                    except DecompressionLimitExceeded as exc:
+                        # decompression bomb inside an ActiveMime part: hard
+                        # error, do not continue with partial subfiles
+                        log.error('Refusing to parse %s: %s'
+                                  % (self.filename, exc))
+                        log.debug('Trace:', exc_info=True)
+                        raise FileOpenError(self.filename, exc)
                     except OlevbaBaseException as exc:
                         if self.relaxed:
                             log.info('%s does not contain a valid OLE file (%s)'
@@ -3178,7 +3297,8 @@ class VBA_Parser(object):
         self.ole_subfiles.append(VBA_Parser(filename, data, container,
                                             relaxed=self.relaxed,
                                             encoding=self.encoding,
-                                            disable_pcode=self.disable_pcode))
+                                            disable_pcode=self.disable_pcode,
+                                            decompression_budget=self.decompression_budget))
 
     def find_vba_projects(self):
         """

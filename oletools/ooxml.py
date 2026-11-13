@@ -59,6 +59,8 @@ __version__ = '0.54.2'
 import sys
 from oletools.common.log_helper import log_helper
 from oletools.common.io_encoding import uopen
+from oletools.common.decompression_budget import (
+    DecompressionBudget, DecompressionLimitExceeded, LimitedReader)
 from zipfile import ZipFile, BadZipfile, is_zipfile
 from os.path import splitext
 import io
@@ -269,8 +271,16 @@ class ZipSubFile(object):
     """
     CHUNK_SIZE = 4096
 
-    def __init__(self, container, filename, mode='r', size=None):
-        """ remember all necessary vars but do not open yet """
+    def __init__(self, container, filename, mode='r', size=None, budget=None):
+        """ remember all necessary vars but do not open yet
+
+        If ``budget`` (a
+        :py:class:`oletools.common.decompression_budget.DecompressionBudget`)
+        is given, every decompressed byte read from this member is charged
+        against it and a :py:class:`DecompressionLimitExceeded` error is
+        raised instead of returning data once the per-member or total limit is
+        reached. Without a budget the behaviour is unchanged.
+        """
         self.container = container
         self.name = filename
         if size is None:
@@ -278,6 +288,11 @@ class ZipSubFile(object):
             logger.debug('zip stream has size {0}'.format(self.size))
         else:
             self.size = size
+        self.budget = budget
+        if self.budget is not None:
+            # reject members whose declared size already exceeds the budget
+            # before any decompression is attempted
+            self.budget.begin_member(filename, declared_size=self.size)
         if 'w' in mode.lower():
             raise ValueError('Can only read, mode "{0}" not allowed'
                              .format(mode))
@@ -299,7 +314,15 @@ class ZipSubFile(object):
         """ open subfile for reading; open mode given to constructor before """
         if self.handle is not None:
             raise IOError('re-opening file not supported!')
-        self.handle = self.container.open(self.name, self.mode)
+        raw_handle = self.container.open(self.name, self.mode)
+        if self.budget is None:
+            self.handle = raw_handle
+        else:
+            # begin_member() was already called in the constructor; re-opening
+            # (e.g. via reset()) happens below without another declaration
+            # check.
+            self.handle = LimitedReader(raw_handle, self.budget, self.name,
+                                        begin=False)
         self.pos = 0
         self.closed = False
         # print('ZipSubFile: opened; size={}'.format(self.size))
@@ -314,6 +337,8 @@ class ZipSubFile(object):
         read given number of bytes (or all data) from stream
 
         returns bytes (i.e. str in python2, bytes in python3)
+
+        raises DecompressionLimitExceeded if a configured budget is exceeded
         """
         if self.handle is None:
             raise IOError('read on closed handle')
@@ -378,6 +403,11 @@ class ZipSubFile(object):
     def reset(self):
         """ close and re-open """
         # print('ZipSubFile: resetting')
+        if self.budget is not None:
+            # the same decompressed bytes will be produced again, so give them
+            # back to avoid counting a legitimate re-read twice
+            self.budget.discard_member()
+            self.budget.begin_member(self.name)
         self.close()
         self.open()
 
@@ -443,11 +473,25 @@ class XmlParser(object):
     different. Method :py:meth:`is_single_xml` tells them apart.
     """
 
-    def __init__(self, filename):
+    def __init__(self, filename, max_member_size=None, max_total_size=None):
+        """ create parser for the given OOXML file (or file-like object)
+
+        ``max_member_size`` and ``max_total_size`` override the default
+        decompression limits applied while reading zip members
+        (see :py:mod:`oletools.common.decompression_budget`). A value of 0
+        disables the corresponding limit; leaving them at ``None`` keeps the
+        safe defaults. These arguments have no effect on single (non-zip)
+        XML files, which are not decompressed.
+        """
         self.filename = filename
         self.did_iter_all = False
         self.subfiles_no_xml = set()
         self._is_single_xml = None
+        member_limit = None if max_member_size == 0 else max_member_size
+        total_limit = None if max_total_size == 0 else max_total_size
+        self.budget = DecompressionBudget(
+            max_member_size=member_limit,
+            max_total_size=total_limit)
 
     def is_single_xml(self):
         """ determine whether this is "regular" ooxml or a single xml file
@@ -499,8 +543,22 @@ class XmlParser(object):
                     # Not sure whether this really is needed...
                     subfiles = tuple(arg for arg in args)
 
+                # total budget: reject packages whose members declare more
+                # data than allowed, even if a caller never reads every member
+                self.budget.check_declared_total(
+                    (zipper.getinfo(subfile).file_size
+                     for subfile in subfiles),
+                    name=self.filename)
                 for subfile in subfiles:
-                    with zipper.open(subfile, 'r') as handle:
+                    # reject the member early if its declared size already
+                    # exceeds the budget, and enforce the actual amount of
+                    # decompressed data while it is being read
+                    declared_size = zipper.getinfo(subfile).file_size
+                    self.budget.begin_member(subfile,
+                                             declared_size=declared_size)
+                    with zipper.open(subfile, 'r') as raw_handle:
+                        handle = LimitedReader(raw_handle, self.budget,
+                                               subfile, begin=False)
                         yield subfile, handle
                 if not args:
                     self.did_iter_all = True
@@ -597,6 +655,10 @@ class XmlParser(object):
                         # cannot do this since we might be using py-builtin xml
                         # while elem.getprevious() is not None:
                         #     del elem.getparent()[0]
+            except DecompressionLimitExceeded:
+                # a decompression bomb is a hard error, never a malformed-xml
+                # case that could be skipped: propagate it unchanged
+                raise
             except ET.ParseError as err:
                 self.subfiles_no_xml.add(subfile)
                 if subfile is None:    # this is no zip subfile but single xml
@@ -687,7 +749,8 @@ class XmlParser(object):
                         extension = extension[1:]   # remove the '.'
                     if extension in content_defaults:
                         content_type = content_defaults[extension]
-                with ZipSubFile(zipper, subfile) as handle:
+                with ZipSubFile(zipper, subfile,
+                                budget=self.budget) as handle:
                     yield subfile, content_type, handle
 
 
